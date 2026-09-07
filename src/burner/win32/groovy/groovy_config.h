@@ -1,9 +1,8 @@
 // Groovy MiSTer - user-facing settings.
 //
 // Include AFTER burner.h (needs INT32 / TCHAR / MAX_PATH), like the other burner headers.
-// Deliberately contains NO socket headers: groovymister.h pulls in <winsock2.h> and
-// src/burner/win32/main.cpp includes the Winsock 1.1 <winsock.h>, which MSVC will not
-// tolerate in one translation unit. See src/dep/groovymister/PROVENANCE.md.
+// Deliberately contains no socket headers: groovymister.h pulls in <winsock2.h> and main.cpp
+// includes the Winsock 1.1 <winsock.h>, which MSVC will not tolerate in one translation unit.
 //
 // Every variable here is persisted verbatim by cona.cpp's VAR()/STR() macros, which
 // stringify the identifier - so the INI key in config/fcadefbneo.ini is literally the C name.
@@ -19,7 +18,7 @@
 // nGroovyCodec - CmdInit's lz4Frames argument
 #define GROOVY_CODEC_RAW        0
 #define GROOVY_CODEC_LZ4        1	// safe on every Groovy core
-#define GROOVY_CODEC_NLC        7	// our default; needs an NLC-capable core
+#define GROOVY_CODEC_NLC        7	// our default; needs an NLC-capable core, RGB888 only
 
 // nGroovyNlcPack
 #define GROOVY_NLC_PACK_TILED   1
@@ -31,7 +30,7 @@ extern INT32 nGroovyPort;				// 32100, video + control + ACK
 extern TCHAR szGroovyPreset[32];		// switchres monitor preset - the most consequential setting
 extern TCHAR szGroovySwitchresIni[MAX_PATH];	// optional; required by the custom/lcd presets
 extern INT32 nGroovyCodec;
-extern INT32 nGroovyRgbMode;			// 0 RGB888 (default), 2 RGB565
+extern INT32 nGroovyRgbMode;			// 0 RGB888 (default), 2 RGB565; NLC forces RGB888
 extern INT32 nGroovyMtu;				// 1500, or 3800 with OSD Jumbo frames on
 extern INT32 bGroovyCrtSafetyCap;		// CRT envelope cap, on by default
 extern INT32 nGroovyVCountSync;			// 0 = automatic frame delay (valid: we are synchronous)
@@ -51,9 +50,10 @@ extern INT32 nGroovyNearLevel;			// 0 = lossless (default), 1-3 = near-lossless
 // Apply built-in defaults. Call BEFORE ConfigAppLoad() so the INI overrides them.
 void GroovyConfigSetDefaults();
 
-// Push the loaded settings into the subsystems that cache them - currently the log level and
-// the file sink. Call AFTER ConfigAppLoad(), and again whenever the dialog applies changes,
-// so file logging is live from startup rather than only once a session opens.
+// Push the loaded settings into the subsystems that cache them, currently the log level and the
+// file sink, and correct any combination the wire cannot carry. Call AFTER ConfigAppLoad(), and
+// again whenever the dialog applies changes, so file logging is live from startup rather than only
+// once a session opens.
 void GroovyConfigApply();
 
 // The compiled-in switchres monitor presets, for the dialog dropdown and validation.

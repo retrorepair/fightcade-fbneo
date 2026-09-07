@@ -1,8 +1,8 @@
 // Groovy MiSTer - switchres wrapper: (width, height, refresh) -> a CRT modeline.
 //
-// switchres is used purely as a CALCULATOR. It is built calc-only (SR_CALC_ONLY) so no real
-// host-display backend is even linked; the modeline it returns goes to the FPGA over UDP and
-// the PC's own monitor is never touched. See src/dep/switchres/PROVENANCE.md.
+// switchres is used purely as a calculator. It is built calc-only (SR_CALC_ONLY), so no real
+// host-display backend is linked; the modeline it returns goes to the FPGA over UDP and the PC's
+// own monitor is never touched.
 //
 // This header exposes no switchres types, so FBNeo translation units never need its headers.
 // Include AFTER burner.h (needs INT32).

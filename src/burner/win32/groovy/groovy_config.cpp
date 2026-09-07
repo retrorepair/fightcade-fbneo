@@ -83,30 +83,42 @@ void GroovyConfigApply()
 	GroovyLogSetLevel(nGroovyLogLevel);
 	GroovyLogSetFileOutput(bGroovyLogToFile);
 
-	// Unconditional, once per process: which binary is this, and was file logging actually on?
-	// Both questions have cost a hardware session. Note bGroovyLogToFile is a SEPARATE ini key
-	// from nGroovyLogLevel - setting the level alone does not produce a file - so record both.
+	// NLC is RGB888 only. The FPGA decoder has three plane cores and a fixed three bytes per
+	// pixel with no pixel-format input, so RGBA888 loses stream framing on the first line and
+	// RGB565 is not encodable at all; CmdInit rejects both outright. Correct the pair here
+	// rather than at session open, because GroovyWants32Bit() fixes the render depth during
+	// VidInit() and never revisits it - a late correction would leave a 16bpp render packing
+	// up to 888 for the whole session.
 	//
-	// *** bVidVSync is reported HERE, and it has to be. ***
+	// This runs on every path that can change either setting: startup, after ConfigAppLoad(),
+	// and the settings dialog's OK and Apply. The value is persisted, so the correction is
+	// written back to the ini.
+	if (nGroovyCodec == GROOVY_CODEC_NLC && nGroovyRgbMode != GroovyMiSTer::RGB_888) {
+		GroovyLogAlways("config: NLC requires RGB888 - rgbMode %d corrected to %d",
+		                (int)nGroovyRgbMode, (int)GroovyMiSTer::RGB_888);
+		nGroovyRgbMode = GroovyMiSTer::RGB_888;
+	}
+
+	// Unconditional, once per process: which binary this is, and whether file logging was on.
+	// bGroovyLogToFile is a separate ini key from nGroovyLogLevel - setting the level alone does
+	// not produce a file - so record both.
 	//
-	// GroovySuppressHostVSync() carries a GroovyLogOnChange breadcrumb, but it is only ever called
-	// inside `(bVidVSync && !GroovySuppressHostVSync())` (vid_directx9.cpp:883 and 7 similar
-	// sites). C++ short-circuits, so when vsync is OFF the function is never evaluated and the
-	// breadcrumb never fires - the log could report "vsync on" but never "vsync off", which is
-	// precisely the case worth knowing. Host vsync decides whether Present() blocks for most of
-	// the frame, which in turn decides how much work is left for the client's WaitSync to absorb,
-	// so its absence sent an investigation down the wrong path. Log it from a site that is always
-	// reached instead.
+	// bVidVSync is reported here because there is nowhere else it reliably can be.
+	// GroovySuppressHostVSync() carries its own breadcrumb, but every call site has the form
+	// (bVidVSync && !GroovySuppressHostVSync()), and short-circuit evaluation means that with
+	// vsync off the function is never entered and the breadcrumb never fires. The log could
+	// report "vsync on" but never "vsync off", which is the case worth knowing: host vsync decides
+	// whether Present() blocks for most of the frame, and therefore how much work is left for
+	// WaitSync to absorb.
 	GroovyLogAlways("startup: %s | logLevel=%d logToFile=%d hostVSync=%d",
 	                GroovyBuildStamp(), (int)nGroovyLogLevel, (int)bGroovyLogToFile,
 	                (int)bVidVSync);
 
-	// One banner per session, recording what was actually in effect. Without this a log is
-	// hard to interpret after the fact - most questions start with "what were the settings".
+	// One banner per session recording what was actually in effect, since interpreting a log
+	// after the fact starts with knowing the settings.
 	if (bGroovyLogToFile) {
-		// NOTE: _TtoA() returns a SHARED static buffer and memsets it on every call
-		// (main.cpp:70-84), so two of them in one expression would both yield the second
-		// string. Convert into separate buffers.
+		// _TtoA() returns a shared static buffer and memsets it on every call, so two of them in
+		// one expression would both yield the second string. Convert into separate buffers.
 		char szHost[64], szPreset[64];
 		TCHARToANSI(szGroovyHost,   szHost,   sizeof(szHost));
 		TCHARToANSI(szGroovyPreset, szPreset, sizeof(szPreset));

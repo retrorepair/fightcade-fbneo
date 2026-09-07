@@ -7,9 +7,9 @@
 #define		HORIZONTAL_ORIENTED_RES		0
 #define		VERTICAL_ORIENTED_RES			1
 
-// @groovy: idle keepalive tick. 250ms against the keepalive's own 2000ms threshold - the poll must
+// @groovy: idle keepalive tick. 250ms against the keepalive's own 2000ms threshold. The poll must
 // be the faster of the two, or a tick landing just under the threshold defers the send by a whole
-// period and roughly doubles the worst-case silence. See GroovyKeepAlive().
+// period and roughly doubles the worst-case silence.
 #define		GROOVY_KEEPALIVE_TIMER_ID	0x47524B41	// 'GRKA'
 #define		GROOVY_KEEPALIVE_TICK_MS	250
 
@@ -3470,15 +3470,14 @@ int ScrnInit()
 
 	// @groovy: the only thing that still runs when the frame loop does not.
 	//
-	// The MiSTer core drops a session that sends nothing for a few seconds and frees the CRT.
-	// Offline that fires the moment a menu opens: OnEnterIdle() below only pumps RunIdle() when
-	// kNetGame, so a Win32 menu or a modal dialog stops everything we would otherwise send.
-	// WM_TIMER is delivered inside both of those modal loops, which is exactly why it is used here.
+	// We opt in to the core's idle timeout, so a session that goes silent for a few seconds is
+	// closed and the CRT freed. Offline that would fire the moment a menu opens, because
+	// OnEnterIdle() only pumps RunIdle() when kNetGame, so a Win32 menu or modal dialog stops
+	// everything we would otherwise send. WM_TIMER is delivered inside both of those modal loops.
 	//
-	// Always on and not tied to the session: GroovyKeepAlive() no-ops unless a session is open AND
-	// nothing has gone on the wire recently, so this costs a message and a comparison. The rate is
-	// deliberately faster than the keepalive's own threshold - polling at the threshold would let a
-	// tick land just under it and defer the send by a whole extra period.
+	// Armed for the life of the window rather than per session: GroovyKeepAlive() no-ops unless a
+	// session is open and nothing has gone on the wire recently, so this costs a message and a
+	// comparison.
 	SetTimer(hScrnWnd, GROOVY_KEEPALIVE_TIMER_ID, GROOVY_KEEPALIVE_TICK_MS, NULL);
 
 	return 0;

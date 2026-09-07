@@ -39,7 +39,7 @@ const char* GroovyBuildStamp();
 // Optional file sink - config/groovy.log
 // ---------------------------------------------------------------------------
 //
-// Off by default. Exists because a failed netplay match otherwise leaves NO evidence: the ring
+// Off by default. Exists because a failed netplay match otherwise leaves no evidence: the ring
 // below is in memory, the settings dialog pauses the game so it cannot be read mid-match, and
 // Fightcade launches a fresh FBNeo per match, so the ring dies with the process.
 //
@@ -47,7 +47,7 @@ const char* GroovyBuildStamp();
 // capturing end in a hang or a kill, and anything still sitting in a stdio buffer would be
 // exactly the part that was needed.
 //
-// NEVER log per frame. Callers are expected to log state *changes*; on top of that the sink
+// Never log per frame. Callers are expected to log state changes; on top of that the sink
 // collapses identical consecutive lines (see GroovyLogRaw) so a caller that slips through
 // cannot flood the file.
 void GroovyLogSetFileOutput(int bEnable);

@@ -405,7 +405,7 @@ int RunIdle()
 			VidPaint(3);
 			AudBlankSound();
 			GroovyWaitSync();			// still required: it is the RIO completion drain
-			GroovyKeepAlive();			// paused = no blits, and the core drops a silent session
+			GroovyKeepAlive();			// paused means no blits, and we opted in to the timeout
 			return 0;
 		}
 		bAppDoStep = 0;
