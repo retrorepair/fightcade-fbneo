@@ -61,7 +61,7 @@ enum GateResult {
 };
 
 // Structural sanity. A modeline that fails this is malformed, not merely aggressive, and
-// would drive the core's PLL into an undefined state - so it is ALWAYS rejected and must
+// would drive the core's PLL into an undefined state, so it is always rejected and must
 // never be user-disableable. switchres will not produce one, but a user INI or a bad
 // re-sync can.
 inline bool IsWellFormed(const Modeline& m)

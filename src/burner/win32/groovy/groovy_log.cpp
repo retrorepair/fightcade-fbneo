@@ -167,7 +167,7 @@ void GroovyLogBanner(const char* pszSummary)
 
 void GroovyTrace(const char* pszFormat, ...)
 {
-	// Deliberately NOT gated on nLogLevel. These are the breadcrumbs that explain a launch
+	// Deliberately not gated on nLogLevel. These are the breadcrumbs that explain a launch
 	// which never reaches Groovy at all, and they only fire at lifecycle transitions, so
 	// there is nothing to save by suppressing them. They still go through GroovyLogRaw, so
 	// the ring, the file and the debugger all see them.
@@ -218,17 +218,17 @@ void GroovyLogRaw(int nLevel, const char* pszLine)
 	LogEmit(pszLine, 0);
 }
 
-// *** The one exception to "file logging is opt-in". ***
+// The one exception to file logging being opt-in.
 //
-// Three hardware sessions in a row have been undiagnosable because the only evidence lived in a
-// file that was not switched on, and the setting itself is fragile: ConfigAppSave() (main.cpp:1194)
-// rewrites the whole ini from memory on every normal exit, so a second FBNeo instance can quietly
-// revert a hand-edit of bGroovyLogToFile between runs.
+// A fault that only shows up on hardware is undiagnosable if the evidence lives in a file the user
+// never switched on, and the setting is fragile in its own right: ConfigAppSave() rewrites the
+// whole ini from memory on every normal exit, so a second FBNeo instance can revert a hand-edit of
+// bGroovyLogToFile between runs.
 //
-// So a *strictly bounded* set of lines is written unconditionally: the build identity, and the
-// session-close record. That is a handful per process run, at lifecycle transitions only. It is
-// NOT a general-purpose logger - anything that could fire per frame must use GroovyLog() and stay
-// behind the user's switch.
+// A strictly bounded set of lines is therefore written unconditionally: the build identity and the
+// session open and close records. That is a handful per process run, at lifecycle transitions only.
+// This is not a general-purpose logger - anything that can fire per frame must use GroovyLog() and
+// stay behind the user's switch.
 void GroovyLogAlways(const char* pszFormat, ...)
 {
 	char szLine[GROOVY_LOG_LINE_LEN];

@@ -22,9 +22,8 @@
 #include <wininet.h>
 #include <winsock.h>
 
-// Groovy MiSTer. Note this header is deliberately socket-free: groovymister.h pulls in
-// <winsock2.h>, which MSVC will not tolerate in the same translation unit as the Winsock 1.1
-// <winsock.h> above. See src/dep/groovymister/PROVENANCE.md.
+// Groovy MiSTer. This header is deliberately socket-free: groovymister.h pulls in <winsock2.h>,
+// which MSVC will not tolerate in the same translation unit as the Winsock 1.1 <winsock.h> above.
 #include "groovy_config.h"		// GroovyConfigApply() after ConfigAppLoad()
 #include "groovy_log.h"			// GroovyTrace() launch breadcrumbs
 

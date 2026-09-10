@@ -70,6 +70,21 @@ static INT32 ReadCombo(int nCtrl, const INT32* pnValues, int nCount, INT32 nFall
 	return pnValues[nSel];
 }
 
+// How many pixel formats the given codec can carry. NLC is RGB888 only, so under it the combo
+// offers one entry rather than a second that CmdInit would refuse. A Win32 combo box cannot grey
+// out individual items, so the list itself is the constraint.
+static int RgbCountFor(INT32 nCodec)
+{
+	return (nCodec == GROOVY_CODEC_NLC) ? 1 : 2;
+}
+
+// nRgbValues[0] is RGB888, so the truncated list keeps its ordering and the caller's current
+// selection still resolves. A 565 selection carried over from LZ4 lands on RGB888.
+static void FillRgbCombo(INT32 nCodec, INT32 nCurrent)
+{
+	FillCombo(IDC_GM_RGBMODE, szRgbNames, nRgbValues, RgbCountFor(nCodec), nCurrent);
+}
+
 // ---------------------------------------------------------------------------
 // Populate / read back
 // ---------------------------------------------------------------------------
@@ -109,7 +124,7 @@ static void DialogToControls()
 	FillCombo(IDC_GM_CODEC,   szCodecNames, nCodecValues, 3, nGroovyCodec);
 	FillCombo(IDC_GM_NLCPACK, szPackNames,  nPackValues,  2, nGroovyNlcPack);
 	FillCombo(IDC_GM_NEAR,    szNearNames,  nNearValues,  4, nGroovyNearLevel);
-	FillCombo(IDC_GM_RGBMODE, szRgbNames,   nRgbValues,   2, nGroovyRgbMode);
+	FillRgbCombo(nGroovyCodec, nGroovyRgbMode);
 	FillCombo(IDC_GM_MTU,     szMtuNames,   nMtuValues,   2, nGroovyMtu);
 	FillCombo(IDC_GM_AUDIO,   szAudioNames, nAudioValues, 3, nGroovyAudioMode);
 	FillCombo(IDC_GM_LOGLEVEL,szLogNames,   nLogValues,   3, nGroovyLogLevel);
@@ -150,12 +165,16 @@ static bool ControlsToConfig()
 	nGroovyCodec     = ReadCombo(IDC_GM_CODEC,    nCodecValues, 3, nGroovyCodec);
 	nGroovyNlcPack   = ReadCombo(IDC_GM_NLCPACK,  nPackValues,  2, nGroovyNlcPack);
 	nGroovyNearLevel = ReadCombo(IDC_GM_NEAR,     nNearValues,  4, nGroovyNearLevel);
+	// Always read the full range: CB_GETCURSEL is bounded by what the list actually holds, and
+	// under NLC that is RGB888 alone. GroovyConfigApply() below is the backstop for any other
+	// route into these variables.
 	nGroovyRgbMode   = ReadCombo(IDC_GM_RGBMODE,  nRgbValues,   2, nGroovyRgbMode);
 	nGroovyMtu       = ReadCombo(IDC_GM_MTU,      nMtuValues,   2, nGroovyMtu);
 	nGroovyAudioMode = ReadCombo(IDC_GM_AUDIO,    nAudioValues, 3, nGroovyAudioMode);
 	nGroovyLogLevel  = ReadCombo(IDC_GM_LOGLEVEL, nLogValues,   3, nGroovyLogLevel);
 
-	// Pushes the log level AND the file sink, and re-banners the config in effect.
+	// Pushes the log level and the file sink, corrects any invalid codec/pixel-format pair, and
+	// re-banners the config in effect.
 	GroovyConfigApply();
 
 	// The monitor preset and the switchres INI are baked in at sr_init(), so a change means
@@ -222,7 +241,7 @@ static void UpdateStatus()
 	// basis for the user's decision about codec and pixel format.
 	if (st.nCostSamples > 0 || st.dPackBlitMs > 0.0) {
 		const double dFrameMs = 100000.0 / (double)(nAppVirtualFps > 0 ? nAppVirtualFps : 6000);
-		// Pacing sleep is deliberate and is NOT a cost, so it is labelled separately from the
+		// Pacing sleep is deliberate and is not a cost, so it is labelled separately from the
 		// sync overhead that actually counts against the budget. See GroovyStatus.
 		_sntprintf(szLine4, 191,
 		           _T("frame cost: pack+blit %.2fms  sync %s %.2fms  worst %.2fms of %.2fms budget%s"),
@@ -312,6 +331,15 @@ static INT_PTR CALLBACK GroovyDialogProc(HWND hDlg, UINT Msg, WPARAM wParam, LPA
 		const int nNotify = HIWORD(wParam);
 
 		if (bInSetup) return FALSE;
+
+		// Rebuild the pixel-format list whenever the codec changes, so NLC cannot be paired
+		// with RGB565. Selecting NLC while 565 is showing moves the selection to RGB888.
+		if (nId == IDC_GM_CODEC && nNotify == CBN_SELCHANGE) {
+			const INT32 nCodec = ReadCombo(IDC_GM_CODEC,   nCodecValues, 3, nGroovyCodec);
+			const INT32 nRgb   = ReadCombo(IDC_GM_RGBMODE, nRgbValues,   2, nGroovyRgbMode);
+			FillRgbCombo(nCodec, nRgb);
+			return TRUE;
+		}
 
 		if (nId == IDOK && nNotify == BN_CLICKED) {
 			const bool bNeedsVideoRebuild = ControlsToConfig();

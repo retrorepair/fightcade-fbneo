@@ -1,13 +1,14 @@
-// Groovy MiSTer - the sender. See groovy_output.h.
+// Groovy MiSTer - the sender.
 //
-// This file and groovy_input.cpp are the ONLY places that reach groovymister.h (and
-// therefore <winsock2.h>), both via the module-internal groovy_internal.h. Keep it that way
-// - see src/dep/groovymister/PROVENANCE.md.
+// This file and groovy_input.cpp are the only places that reach groovymister.h, and therefore
+// <winsock2.h>, both through the module-internal groovy_internal.h. main.cpp includes the
+// Winsock 1.1 <winsock.h>, which MSVC will not tolerate alongside <winsock2.h> in one
+// translation unit, so keep the boundary where it is.
 //
 // Threading: none. FBNeo renders into a CPU buffer, so there is no GPU readback to hide and
-// nothing to gain from a sender thread. Everything here runs on the emulation thread, which
-// is exactly the synchronous shape the Groovy client is designed around: one thread owns
-// CmdInit / CmdSwitchres / CmdBlit / CmdAudio / WaitSync.
+// nothing to gain from a sender thread. Everything here runs on the emulation thread, which is
+// the synchronous shape the Groovy client is designed around: one thread owns CmdInit,
+// CmdSwitchres, CmdBlit, CmdAudio and WaitSync.
 
 #include "burner.h"
 
@@ -46,23 +47,21 @@ static bool   bStreaming    = false;	// a modeline is in effect and blits are go
 // confusion about the current state.
 static bool   bEverConnected = false;
 
-// Has this session's CMD_CLOSE already gone out? Exactly one is allowed - see the long comment
-// above GroovySendRawCmd() for why a second one is pointless (the core now ignores it).
+// Has this session's CMD_CLOSE already gone out? Exactly one is allowed; the core ignores any
+// that arrive with no session open.
 static bool   bRawCloseSent  = false;
 
-// *** A deliberate close must STAY closed. ***
+// A deliberate close must stay closed.
 //
-// Without this, GroovySessionClose() was immediately undone by the next rendered frame:
-// it sets nLastConnectFailMs = 0, SessionRetryDue() reads 0 as "never failed, retry now", and
-// GroovyFrameReady() re-opens on that basis. Nothing stops frames the instant we close -
-// OnClose calls PostQuitMessage(0), which only lands when the loop next dequeues WM_QUIT, and
-// QuarkEnd sets bMediaExit, which run.cpp:641 only acts on inside if (PeekMessage(...)). So the
-// live sequence could be close -> re-open -> exit, leaving the core connected and displaying
-// our last frame with no further close.
+// Frames do not stop the instant we close: OnClose posts WM_QUIT, which lands only when the loop
+// next dequeues it, and QuarkEnd sets bMediaExit, which run.cpp acts on inside its PeekMessage
+// branch. Without this latch the next rendered frame re-opens the session - GroovySessionClose()
+// leaves nLastConnectFailMs at 0, which SessionRetryDue() reads as "never failed, retry now" -
+// and the process then exits with the core still connected and holding our last frame.
 //
-// Cleared only on an edge that genuinely means "a new session is wanted" - see the top of
-// GroovyFrameReady(). NOT set by the internal SessionClose("params changed") reconnect, which
-// must still be able to come straight back up.
+// Cleared only on an edge that means a new session is wanted (see the top of GroovyFrameReady()).
+// The internal SessionClose("params changed") reconnect does not set it, since that path must be
+// able to come straight back up.
 static bool   bShutdownRequested = false;
 
 // The endpoint we ACTUALLY opened with. The close goes here rather than to whatever the config
@@ -71,44 +70,38 @@ static bool   bShutdownRequested = false;
 static char   szOpenHost[64] = "";
 static INT32  nOpenPort      = 0;
 
-// *** Keepalive against the core's idle timeout. ***
+// Keepalive for an idle session.
 //
-// The core closes a session that sends nothing for its configured interval (OSD Server -> Idle
-// timeout: 5s default / 10 / 15 / Off) and frees the CRT. That is the safety net for a client that
-// is killed or crashes - but it also fires when we are alive and merely quiet, which offline
-// happens the moment a menu opens: OnEnterIdle (scrn.cpp:3154) only pumps RunIdle when kNetGame, so
-// a Win32 menu or modal dialog stops everything.
+// We advertise GM_CAP_KEEPALIVE at CmdInit, which licenses the core to close a session that stays
+// silent for its OSD idle timeout. That is what frees the user's CRT when this process is killed
+// without sending CMD_CLOSE. The obligation is ours: send something whenever we are alive and not
+// blitting. Offline that starts the moment a menu opens, because OnEnterIdle() only pumps RunIdle
+// when kNetGame, so a Win32 menu or modal dialog stops the frame loop entirely.
 //
-// nLastWireMs is the timestamp of the last thing we actually put on the wire - updated by the blit
-// AND the audio path. The keepalive fires only once that goes stale, so at 60fps it never fires at
-// all: no extra packets while emulating, which is the whole design constraint.
+// nLastWireMs is stamped by the blit and the audio path, so during emulation the gate below never
+// opens and no extra packets go out.
 static UINT32 nLastWireMs = 0;
 
-// 2s against a 5s core default, well inside the handoff's "<= timeout/2". The TICK that drives it
-// must be faster than this threshold or a tick landing just under it defers the send by a whole
-// period - see GroovyKeepAlive(). At 2000 + 250 the worst-case silence is 2.25s normally and 4.5s
-// if a single keepalive is lost, both under 5s. Surviving one lost datagram is exactly what the
-// halving rule is for.
+// 2s against the shortest timeout the OSD offers (5s), which we cannot read. Callers must poll
+// faster than this: a tick landing just under the threshold defers the send by a whole period.
+// scrn.cpp polls at 250ms, so worst-case silence is 2.25s, or 4.5s if one datagram is lost.
 #define GROOVY_KEEPALIVE_IDLE_MS 2000
 
-// *** Dead-session detection. ***
+// Dead-session detection.
 //
-// The core no longer holds a session forever, so we can now be disconnected without being told. If
-// we keep blitting into that, two bad things happen - one to the core, one to us:
+// We can be disconnected without being told: a lost keepalive lets the idle timeout fire, and any
+// CMD_INIT from any address takes the session over. The core then refuses session-scoped commands
+// while disconnected, so our blits are dropped and frameEcho simply stops advancing while we keep
+// streaming into nothing.
 //
-//   The core's setClose() frees poc and deliberately does NOT null it (groovy.cpp:967-969, because
-//   the logo path dereferences it), and CMD_BLIT is not gated on isConnected. So our blits write
-//   through freed memory and sendACK() reads it back - the core hands us garbage frameEcho/vCount.
+// Two tests, because "did the echo change" alone is not enough. That is what the client's own
+// reconnect watchdog uses, and it treats any larger value as progress, so a corrupt or reordered
+// echo resets its counter in exactly the case it is most needed. The second test asks whether the
+// echo is plausible for what we sent: it may lag us by pipeline depth, but it can never lead us.
 //
-//   That garbage reaches DiffTimeRaster(), which turns it into an enormous diffRaster, and
-//   WaitSync's loop does sleepTime += diffRaster on EVERY iteration. A large positive sleepTime
-//   makes that busy-spin run for minutes: the reported "FBNeo freezes in the menu, needs a
-//   force-kill".
-//
-// The vendored autoreconnect watchdog cannot catch this. Its test is "frameEcho > lastSeen", and
-// garbage that happens to be larger reads as progress - so it resets its counter and never fires,
-// in precisely the case it is most needed. Hence the second test below: not "did the echo change"
-// but "does the echo make sense given what we sent". Garbage cannot satisfy that.
+// The stale test is the one that normally fires. The plausibility test costs nothing and bounds
+// the damage if a core ever hands back nonsense, which reaches DiffTimeRaster() and turns into a
+// multi-second busy-spin inside WaitSync.
 static UINT32 nLastEchoSeen   = 0;
 static UINT32 nNoEchoBlits    = 0;
 static UINT32 nBadEchos       = 0;
@@ -127,37 +120,26 @@ static bool   bSessionDead    = false;
 // healthy session.
 #define GROOVY_BAD_ECHOS 5
 
-// *** The reconnect freeze - fixed upstream at the root; this now only resets OUR counter. ***
+// Reset our own frame counter for a new session.
 //
-// Originally: CmdInit re-zeroed NONE of the client's session-scoped fields - they were
-// initialised in the GroovyMister constructor only, so four fields driving the raster servo
-// (fpga.frame, fpga.frameEcho, fpga.vCount, fpga.vCountEcho) survived every reconnect, ours and
-// the client's internal one alike. That hard-locked FBNeo on a cable-pull: SessionOpen()
-// correctly reset nBlitFrame to 0, but the resync in GroovyFrameReady() immediately adopted the
-// DEAD session's fpga.frame (5472), so we blitted frame 5473 into a core whose counter had
-// restarted at ~1 - DiffTimeRaster() computed a spread of 5472, and
-// diffTime = m_widthTime(640) * dif = 4.59e8 ticks, 46 SECONDS of busy-spin inside WaitSync per
-// echo change, accumulating. Hence the force-kill. (m_frameTime = m_widthTime * vTotal, so the
-// implied spin is generally (m_frameTime * spread) / 2 - half a frame period per frame of
-// divergence. Normal operation is a spread of 1.)
+// The client zeroes its fpga.* raster state at the top of every CmdInit, so a dead session's
+// counters can no longer cross a reconnect. It has no notion of nBlitFrame, which is ours, so
+// this is the part nothing upstream can do for us.
 //
-// Fixed upstream (docs/UPSTREAM_REPORT_groovymister_reconnect_state.md -> the vendored client's
-// resetSessionState(), called unconditionally at the top of every CmdInit): fpga.* can no longer
-// carry a dead session's counters across a reconnect, ours or the client's internal one. This
-// function now exists only to reset OUR OWN nBlitFrame - the library has no notion of it, so
-// nothing upstream can do that part for us. Call this on every session start and on every
-// observed internal reconnect (reconnectEpoch() change).
+// It matters because the resync in GroovyFrameReady() adopts fpga.frame. Blitting a counter from
+// a previous session into a core that restarted at zero gives DiffTimeRaster() a spread of
+// thousands, and WaitSync accumulates sleepTime += diffRaster on every iteration - half a frame
+// period of busy-spin per frame of divergence, which is minutes.
+//
+// Call on every session start and on every observed internal reconnect (reconnectEpoch() change).
 static void ResetClientFrameState();
 
-// Above this many frames of (frameEcho - frame), refuse to hand the state to WaitSync at all: the
-// implied sleep is spread/2 frame periods, so 8 caps it at ~4 (67ms at 60Hz) instead of 46 seconds.
-// A legitimate lead is 1, occasionally 2 with frame delay - we run one frame ahead of the display,
-// never thousands.
+// Above this many frames of (frameEcho - frame), refuse to hand the state to WaitSync at all. The
+// implied sleep is spread/2 frame periods, so 8 caps it at roughly 67ms at 60Hz. A legitimate lead
+// is 1, occasionally 2 with frame delay; we run one frame ahead of the display, never thousands.
 //
-// The vendored DiffTimeRaster() now carries the identical clamp internally (same threshold, same
-// reasoning - it was our suggestion, absorbed upstream). This copy stays as defense-in-depth and,
-// more importantly, diagnostics: see the comment at its call site in GroovyWaitSync() for why our
-// copy is the one that actually reaches a support log.
+// The client carries the same clamp internally now. This copy is kept for the diagnostic - see the
+// call site in GroovyWaitSync() for why ours is the one that reaches a support log.
 #define GROOVY_RASTER_MAX_SPREAD 8
 
 static bool   bSwitchresUp  = false;
@@ -201,15 +183,13 @@ static GroovyModeResult eLastRefusal = GROOVY_MODE_OK;
 static double dPackBlitMs   = 0.0;	// pack + encode + post, inside GroovyFrameReady()
 static double dSyncMs       = 0.0;	// total time inside WaitSync, whichever regime
 
-// *** The two halves of dSyncMs, and the reason this instrumentation was rewritten. ***
+// The two halves of dSyncMs.
 //
-// WaitSync does two completely different jobs depending on who owns the frame clock, and
-// charging them to the same counter made the readout meaningless. When WE pace, sleeping out
-// the remainder of the frame period IS the job - it is most of a frame by construction, and a
-// healthy offline session honestly reported "sync 13.70ms ... 296/299 frames over 50% budget".
-// When something else paces (netplay), sleepTime should be 0, so every millisecond spent in
-// there is pure overhead - and that is the number that actually says whether Groovy is eating
-// a match's frame budget.
+// WaitSync does two different jobs depending on who owns the frame clock, and charging both to one
+// counter makes the readout meaningless. When we pace, sleeping out the remainder of the frame
+// period is the job, and by construction that is most of a frame. When something else paces
+// (netplay), sleepTime should be 0, so every millisecond in there is overhead - and that is the
+// number that says whether Groovy is eating a match's frame budget.
 static double dPaceSleepMs    = 0.0;	// last frame, when we owned the clock: intentional
 static double dSyncOverheadMs = 0.0;	// last frame, when we did not: chargeable
 
@@ -289,17 +269,14 @@ static void AccumulateFrameCost()
 			          dPaceSleepMs, dWorstFrameMs, nBudgetMissed, nCostSamples,
 			          GROOVY_BUDGET_FRACTION * 100.0);
 
-			// @groovy diagnostic: is the sync overhead above actually costing netplay anything?
+			// @groovy diagnostic: does the sync overhead above cost netplay anything?
 			//
-			// The model to test is that the spin is simply the COMPLEMENT of this frame loop's own
-			// work - so it should be large exactly when GGPO is NOT the bottleneck. That predicts
-			// high overhead alongside a HIGH idle count (plenty of slack) and FEW rollbacks, and
-			// the reverse when the peer is struggling. Measured on hardware, two sessions on an
-			// identical modeline gave mean 0.23ms and mean 9.62ms; the fast one was the session
-			// full of GGPO stalls and frameskips.
-			//
-			// If that holds, the spin only ever consumes time nothing else wanted and can be left
-			// alone. If it does not, the model is wrong and this needs revisiting.
+			// The spin should be the complement of this frame loop's own work, so it is large
+			// exactly when GGPO is not the bottleneck: high overhead alongside a high idle count
+			// and few rollbacks, and the reverse when the peer is struggling. Two hardware
+			// sessions on an identical modeline measured 0.23ms and 9.62ms mean, and the fast one
+			// was the session full of GGPO stalls and frameskips. On that reading the spin only
+			// consumes time nothing else wanted; these counters are what would show otherwise.
 			if (kNetGame) {
 				GroovyLog(GROOVY_LOG_INFO,
 				          "netplay load: %u ggpo_idle calls over %u frames (%.1f/frame), "
@@ -327,12 +304,11 @@ static void AccumulateFrameCost()
 
 // The raster line each blit syncs to.
 //
-// vCountSync == 0 means "automatic frame delay", and that calculation
-// (groovymister.cpp:962-976) is built entirely on m_emulationTime - which only WaitSync()
-// writes, and which measures wall time BETWEEN WaitSync calls. The moment something else owns
-// the frame clock that interval becomes the whole frame period, the calculation degenerates to
-// vSync = 1 permanently, and the "automatic" part is a fiction. So under an external clock we
-// pick the line explicitly rather than pretending.
+// vCountSync 0 means automatic frame delay, and that calculation rests entirely on
+// m_emulationTime, which only WaitSync() writes and which measures wall time between WaitSync
+// calls. Once something else owns the frame clock, that interval is the whole frame period, the
+// calculation degenerates to vSync = 1 permanently, and the automatic part is a fiction. Under an
+// external clock we pick the line explicitly instead.
 static uint16_t EffectiveVCountSync()
 {
 	if (kNetGame && nGroovyVCountSync == 0) {
@@ -419,7 +395,7 @@ static void SessionClose(const char* pszWhy)
 
 // Bring the modeline calculator up.
 //
-// This MUST happen before the first GroovySwitchresResolve(), not inside SessionOpen():
+// This must happen before the first GroovySwitchresResolve(), not inside SessionOpen():
 // resolve answers UNREADY while switchres is down, and UNREADY is a "retry later" that does
 // not open a session - so initialising it inside SessionOpen deadlocks and nothing ever
 // streams. Idempotent, so calling it every frame costs a bool test.
@@ -445,24 +421,14 @@ static bool SessionOpen()
 
 	if (!EnsureSwitchres()) return false;
 
-	// NLC does not round-trip RGB565.
-	//
-	// Verified on the loopback rig with NO FBNeo code in the path - a known 320x240 pattern
-	// encoded by the vendored client and decoded by soft_groovy comes back with ~99.6% of
-	// bytes wrong and full-scale per-channel deltas. LZ4+RGB565, NLC+RGB888 and LZ4+RGB888
-	// are all byte-perfect, so this is specific to the NLC 565 path and is upstream, not
-	// ours. Left unguarded it is a silent garbled picture - the same failure class as Rice
-	// against a pre-rice core, except this one we CAN detect.
-	//
-	// LZ4 carries RGB565 losslessly, so honour the user's bandwidth choice and switch the
-	// codec rather than refusing to stream. Say so loudly: never substitute silently.
-	INT32 nCodec = nGroovyCodec;
-	if (nCodec == GROOVY_CODEC_NLC && nGroovyRgbMode == RGB_565) {
-		nCodec = GROOVY_CODEC_LZ4;
-		GroovyLog(GROOVY_LOG_ERROR,
-		          "NLC cannot carry RGB565 (upstream codec limitation) - using LZ4 instead, "
-		          "which is lossless at 565. Choose RGB888 to use NLC.");
-		VidSNewShortMsg(_T("Groovy: NLC+RGB565 unsupported, using LZ4"), 0xFFBF3F, 5000, 0);
+	// NLC is RGB888 only, and CmdInit rejects any other pixel format rather than streaming a
+	// picture the core cannot decode. GroovyConfigApply() normalises the pair on every path
+	// that can set either value, so this should never fire; it is here because the cost of
+	// being wrong is a refused session with no obvious cause.
+	if (nGroovyCodec == GROOVY_CODEC_NLC && nGroovyRgbMode != RGB_888) {
+		GroovyLogAlways("NLC requires RGB888 - correcting rgbMode %d at session open",
+		                (int)nGroovyRgbMode);
+		nGroovyRgbMode = RGB_888;
 	}
 
 	// Everything below must precede CmdInit.
@@ -487,11 +453,18 @@ static bool SessionOpen()
 		gm.setInputCaps(GM_CAP_INPUTS_V2);
 	}
 
-	if (nCodec == GROOVY_CODEC_NLC) {
+	if (nGroovyCodec == GROOVY_CODEC_NLC) {
 		gm.setNlcPack((uint8_t)nGroovyNlcPack);
 		gm.setNearLevel((uint8_t)nGroovyNearLevel);
 	}
 	gm.setAutoReconnect((uint8_t)(bGroovyAutoReconnect ? 1 : 0));
+
+	// Opt in to the core's idle timeout. Without this the core never closes a silent session,
+	// and a process killed without sending CMD_CLOSE - which is how our launcher ends a match -
+	// leaves its last frame on the user's CRT until something else reconnects. Opting in is the
+	// promise GroovyKeepAlive() keeps. It is independent of setInputCaps() and rides the same
+	// CMD_INIT caps byte.
+	gm.setKeepAlive(1);
 
 	// Audio is fixed for the life of the session.
 	INT32 nSoundRate = 0, nSoundChan = 0;
@@ -507,11 +480,11 @@ static bool SessionOpen()
 	}
 
 	GroovyLog(GROOVY_LOG_ERROR, "connecting to %s:%d (codec %d, rgb %d, mtu %d, audio %d/%d)",
-	          _TtoA(szGroovyHost), (int)nGroovyPort, (int)nCodec, (int)nGroovyRgbMode,
+	          _TtoA(szGroovyHost), (int)nGroovyPort, (int)nGroovyCodec, (int)nGroovyRgbMode,
 	          (int)nGroovyMtu, (int)nSoundRate, (int)nSoundChan);
 
 	const int nRet = gm.CmdInit(_TtoA(szGroovyHost), (uint16_t)nGroovyPort,
-	                            (int)nCodec, (uint32_t)nSoundRate, (uint8_t)nSoundChan,
+	                            (int)nGroovyCodec, (uint32_t)nSoundRate, (uint8_t)nSoundChan,
 	                            (uint8_t)nGroovyRgbMode, (uint16_t)nGroovyMtu);
 	if (nRet != 0) {
 		SetState("no ACK from %s - wrong IP, core not running, firewall, or MTU",
@@ -538,19 +511,17 @@ static bool SessionOpen()
 	nLastReconEpoch = gm.reconnectEpoch();
 	nLastWireMs     = (UINT32)timeGetTime();
 
-	// *** Load-bearing: CmdInit does NOT do this for us. ***
-	// Without it the dead session's fpga.frame comes straight back through the resync in
-	// GroovyFrameReady(), we blit a five-thousand-frame-old counter into a core that restarted at
-	// zero, and WaitSync spins for ~46s. See ResetClientFrameState().
+	// CmdInit does not do this for us - nBlitFrame is ours.
 	ResetClientFrameState();
 
-	// Remember where we connected, so the close cannot be aimed somewhere else (F2).
+	// Remember where we connected, so a mid-session edit to the host cannot aim the close
+	// somewhere other than where we opened.
 	strncpy(szOpenHost, _TtoA(szGroovyHost), sizeof(szOpenHost) - 1);
 	szOpenHost[sizeof(szOpenHost) - 1] = '\0';
 	nOpenPort = nGroovyPort;
 	bHaveModeline  = false;
 	nBlitFrame     = 0;
-	nOpenCodec     = nCodec;	// the codec we ACTUALLY opened with, after the 565 substitution
+	nOpenCodec     = nGroovyCodec;
 	nOpenRgbMode   = nGroovyRgbMode;
 	nOpenMtu       = nGroovyMtu;
 	nOpenSoundRate = nSoundRate;
@@ -558,15 +529,21 @@ static bool SessionOpen()
 
 	if (bGroovyUseInputs) {
 		gm.ResendInputSubscribe();		// UDP-loss insurance; also what fixes reconnects
-		GroovyLog(GROOVY_LOG_ERROR, "inputs bound, negotiated caps 0x%02X", gm.getInputCaps());
 	}
 
-	// Unconditional (F3): one bounded line per session. A log that shows an open with no matching
-	// close is then the smoking gun, readable at a glance, without the user having had to switch
-	// file logging on beforehand.
-	GroovyLogAlways("session OPEN -> %s:%d (codec=%d rgb=%d) [%s]",
-	                szOpenHost, (int)nOpenPort, (int)nCodec, (int)nGroovyRgbMode,
-	                GroovyBuildStamp());
+	// getInputCaps() reports what the core granted, not what we asked for. A core older than
+	// version 2 drops the whole caps byte and the keepalive promise with it. That is harmless,
+	// since such a core has no idle timeout either, but this is the only way to tell.
+	if (!(gm.getInputCaps() & GM_CAP_KEEPALIVE)) {
+		GroovyLogAlways("keepalive opt-in not granted (caps 0x%02X) - this core will hold the "
+		                "session open even if we die", (unsigned)gm.getInputCaps());
+	}
+
+	// One bounded line per session, unconditional: an open with no matching close is then readable
+	// at a glance without the user having switched file logging on beforehand.
+	GroovyLogAlways("session OPEN -> %s:%d (codec=%d rgb=%d caps=0x%02X) [%s]",
+	                szOpenHost, (int)nOpenPort, (int)nGroovyCodec, (int)nGroovyRgbMode,
+	                (unsigned)gm.getInputCaps(), GroovyBuildStamp());
 
 
 	// Record the netplay context once, at the top of the log, so a support question about a
@@ -613,33 +590,25 @@ static bool SessionOpen()
  #define GroovySockError()   (errno)
 #endif
 
-#define GROOVY_CMD_CLOSE      1		// handoff Appendix A
+#define GROOVY_CMD_CLOSE      1
 #define GROOVY_CMD_GET_STATUS 5
 
 // Send a 1-byte command on a fresh socket, never the client's. Returns 1 if the stack accepted it,
 // 0 if the send failed, -1 if we could not even open a socket. pszWhat only labels the log line.
 //
-// *** The Groovy client cannot do this for us on Windows. ***
+// Neither of the client's own one-byte senders works here on Windows. CmdInit creates its socket
+// with WSA_FLAG_REGISTERED_IO and then connects it; CmdSendClose() calls plain sendto() on that
+// socket and discards the return value, which fails every time because RIO sockets are not
+// supported alongside the standard Winsock calls. CmdSendKeepAlive() uses the RIO send path
+// properly, but a keepalive fires precisely when we are not blitting, which is when nothing is
+// draining the send completion queue; a long enough idle stretch fills it and RIOSend then fails
+// silently. Both are correct on POSIX, where the socket is plain and unconnected.
 //
-// USE_RIO is hardcoded to 1 (groovymister.cpp:37), so CmdInit builds m_sockFD with
-// WSASocket(..., WSA_FLAG_REGISTERED_IO) and then ::connect()s it (:516, :650). CmdSendClose()
-// (:388) calls plain sendto() on that socket and DISCARDS the return value. Winsock documents
-// WSAEISCONN for sendto on a connected socket, and RIO sockets are not supported alongside the
-// standard Winsock I/O calls - so on Windows it fails, silently, every time. It is correct on
-// POSIX, where the same socket is plain and unconnected, which is exactly why the loopback rig
-// could never have caught it.
-//
-// The same reasoning applies to the keepalive, plus one of its own: the vendored CmdSendKeepAlive()
-// (added upstream in the same pull as the CmdSwitchres ACK fix - not adopted here) also uses the
-// RIO send path, and a keepalive by definition fires when we are NOT blitting - which is exactly
-// when nothing is draining the send completion queue. Undrained completions would eventually make
-// RIOSend fail silently over a long enough idle stretch. Our own socket has no queue.
-//
-// A fresh socket sidesteps all of it: not RIO-registered, not connected, nothing being deregistered
-// underneath it, and blocking - so sendto returns only once the stack owns the datagram. Winsock
-// itself is up for the whole process from main.cpp's WSAStartup, independent of the client's
-// refcount, so this still works after teardownVideo() has called WSACleanup(). And the core accepts
-// these from any source: process_packet() switches on byte 0 and never looks at the sender.
+// A fresh socket avoids all of it: not RIO-registered, not connected, nothing being deregistered
+// underneath it, and blocking, so sendto returns only once the stack owns the datagram. Winsock is
+// up for the whole process from main.cpp's WSAStartup, independent of the client's refcount, so
+// this still works after teardownVideo() has called WSACleanup(). The core accepts these from any
+// source: it switches on byte 0 and never looks at the sender.
 static int GroovySendRawCmd(const char* pszHost, int nPort, char cCmd, const char* pszWhat)
 {
 	if (pszHost == NULL || pszHost[0] == '\0') return -1;
@@ -669,38 +638,29 @@ static int GroovySendRawCmd(const char* pszHost, int nPort, char cCmd, const cha
 	return (nRet == 1) ? 1 : 0;
 }
 
-// *** Exactly ONE CMD_CLOSE per session. Repeating it is not safe. ***
+// Exactly one CMD_CLOSE per session, latched on bRawCloseSent.
 //
-// The obvious hardening for an unacknowledged datagram is to send it two or three times, and
-// that is what this code did first. The core cannot take it: setClose() ends with free(poc)
-// (groovy.cpp:953) and never NULLs the pointer, and the CMD_CLOSE case is not gated on
-// isConnected (:2187). So N consecutive closes with no CMD_INIT between them are N-1 double
-// frees inside the MiSTer's groovy server. One datagram, latched, is the correct behaviour -
-// and it is what the other working integrations send.
+// Repeating an unacknowledged datagram is the obvious hardening and it gains nothing here: the
+// core ignores a close that arrives with no session open, so the second and third are discarded.
 //
-// The residual risk we accept: a close landing mid-payload is dispatched through the UDP-loss
-// recovery path (:2123), which loses it only when the compressed frame length happens to be
-// 1 (mod 1472). That is ~0.07% of frames, against a certainty of corrupting the core's heap.
-//
-// The latch itself is bRawCloseSent, declared with the other session state at the top.
+// The residual risk we accept is a close landing mid-payload, where it is dispatched through the
+// UDP-loss recovery path and lost if the compressed frame length happens to be 1 (mod 1472). That
+// is roughly 0.07% of frames.
 
 void GroovySessionClose(const char* pszReason)
 {
 	// Reached from several exit paths, some of them more than once. Everything below is
-	// idempotent, and it must stay FAST: on the MENU_QUIT path this runs inside DrvExit(),
+	// idempotent, and it must stay fast: on the MENU_QUIT path this runs inside DrvExit(),
 	// which Fightcade executes BEFORE QuarkEnd() -> ggpo_close_session() (scrn.cpp:945-952).
 	// Anything slow here delays the match result reaching the server.
 	const UINT64 nStart = GroovyTickNow();
 	const bool bWasOpen = bSessionOpen;
 
-	// *** Log on the way IN, unconditionally. ***
-	//
-	// Three rounds of hardware logs could not answer "did the close even run?", because the
-	// only trace lived inside the bWasOpen branch - so "ran and found no session" and "never
-	// ran at all" produced identical, empty evidence. They need different answers: the first
-	// is our bug, the second means the process was killed and nothing in-process can help.
-	// GroovyLogAlways, not GroovyLog: this record must survive the user not having switched
-	// file logging on. It is bounded - a handful of lines per process run.
+	// Logged on the way in, unconditionally, and before the bWasOpen branch below. "Ran and found
+	// no session" and "never ran at all" are different diagnoses - the first is a bug here, the
+	// second means the process was killed and nothing in-process can help - and a trace inside the
+	// branch cannot tell them apart. GroovyLogAlways rather than GroovyLog, so the record survives
+	// the user not having switched file logging on; it is a handful of lines per process run.
 	GroovyLogAlways("close: entered (%s) - sessionOpen=%d clientConnected=%d everConnected=%d [%s]",
 	                pszReason ? pszReason : "unspecified",
 	                (int)bWasOpen, (int)(gm.isConnected() ? 1 : 0), (int)bEverConnected,
@@ -724,17 +684,11 @@ void GroovySessionClose(const char* pszReason)
 		}
 	}
 
-	// Deliberately NOT calling gm.CmdSendClose() as well: it is a no-op on Windows, which is the
-	// whole reason GroovySendRawCmd() exists above.
-	//
-	// CmdClose(), inside SessionClose(), still runs - we need its local teardown (RIO buffers,
-	// socket, WSACleanup) and there is no public entry point that tears down without also posting
-	// its own CMD_CLOSE. That post is the one that does not arrive on Windows, so in practice the
-	// core sees precisely one close.
-	//
-	// A duplicate is no longer dangerous in any case: the core now gates CMD_CLOSE on isConnected
-	// (groovy.cpp:2210), the fix we asked for in docs/HANDOFF_core_idle_timeout.md. It still keeps
-	// poc non-NULL after free() on purpose, because the screensaver/logo path dereferences it.
+	// gm.CmdSendClose() is not called as well: it is a no-op on Windows, which is why
+	// GroovySendRawCmd() exists. CmdClose() inside SessionClose() still runs, because we need its
+	// local teardown of the RIO buffers, socket and WSACleanup, and there is no entry point that
+	// does that without also posting its own CMD_CLOSE. That post is the one that never arrives,
+	// so the core sees exactly one close either way.
 	SessionClose("requested");
 	nLastConnectFailMs = 0;
 	bConnectGaveUp     = false;
@@ -750,8 +704,8 @@ void GroovySessionClose(const char* pszReason)
 	                pszReason ? pszReason : "unspecified", GroovyTickMsSince(nStart));
 }
 
-// Called after every blit. Decides whether the core is still really there; see the block comment
-// on nLastEchoSeen for why the plausibility test exists and why "did it change" is not enough.
+// Called after every blit. Decides whether the core is still there. See the block comment on
+// nLastEchoSeen for why "did the echo change" is not a sufficient test on its own.
 static void CheckSessionAlive()
 {
 	if (bSessionDead) return;
@@ -775,9 +729,9 @@ static void CheckSessionAlive()
 
 	const UINT32 nEcho = gm.fpga.frameEcho;
 
-	// The echo acknowledges a frame we sent, so it may legitimately LAG us (that is just pipeline
-	// depth) but can never meaningfully LEAD us. A lead is the fingerprint of the core reading
-	// freed memory. Require a few in a row so one odd datagram cannot kill a healthy session.
+	// The echo acknowledges a frame we sent, so it may lag us by pipeline depth but can never
+	// meaningfully lead us. Require a few in a row, so one corrupt or reordered datagram cannot
+	// kill a healthy session.
 	if (nEcho > nBlitFrame + GROOVY_ECHO_SLACK) {
 		nBadEchos++;
 	} else {
@@ -800,20 +754,19 @@ static void CheckSessionAlive()
 	                         : "core stopped acknowledging",
 	                nEcho, nBlitFrame);
 
-	// Hand control to the slower back-off. The client's watchdog retries CmdInit every second, and
-	// each failed attempt is three blocking getACK(60) calls - up to 180ms on the emulation thread.
-	// Unbounded, that stutters a live match once a second for a MiSTer that may be gone for good.
-	// (Largely belt-and-braces: CmdClose() clears m_initHost, which the watchdog also requires.)
+	// Hand control to the slower back-off. The client's watchdog retries CmdInit every second and
+	// each failed attempt blocks on getACK, which stutters a live match once a second for a MiSTer
+	// that may be gone for good. Largely belt-and-braces, since CmdClose() clears m_initHost and
+	// the watchdog needs that too.
 	gm.setAutoReconnect(0);
 
-	// Closes our side and stops GroovyFrameSync() touching WaitSync, which is what actually keeps
-	// the garbage away from the spin loop.
+	// Closes our side and stops GroovyFrameSync() calling WaitSync, which is what keeps an
+	// implausible echo out of its spin loop.
 	SessionClose("core stopped responding");
 
-	// Take the normal back-off, or the next frame would see bSessionOpen == false with
-	// nLastConnectFailMs == 0 ("never failed, retry now") and re-init immediately - a reconnect
-	// storm. This gives 5s offline, and stands down entirely in netplay rather than stuttering a
-	// live match, which is the policy the connect path already follows.
+	// Take the normal back-off. Without it the next frame sees bSessionOpen false with
+	// nLastConnectFailMs at 0, reads that as "never failed, retry now", and re-inits immediately.
+	// This gives 5s offline and stands down entirely in netplay, matching the connect path.
 	NoteConnectFailed();
 }
 
@@ -822,27 +775,21 @@ void GroovyKeepAlive()
 	// Nothing to hold open, or we deliberately closed it.
 	if (!bSessionOpen || bShutdownRequested) return;
 
-	// *** The gate is elapsed WIRE time, not a fixed period. ***
-	//
-	// nLastWireMs is stamped by every blit and every audio frame, so during emulation this test
-	// simply never passes and not one extra packet goes out. The keepalive exists only for the
-	// genuinely silent case - a menu, a modal dialog, a pause - where the core would otherwise
-	// time us out and free the CRT while we are still very much alive.
-	//
-	// Callers are expected to poll this FASTER than the threshold (the WM_TIMER in scrn.cpp runs
-	// at 250ms). Polling at the threshold itself would let a tick land just under it and defer
-	// the send by a whole extra period, roughly doubling the worst-case silence.
+	// The gate is elapsed wire time, not a fixed period. nLastWireMs is stamped by every blit and
+	// every audio frame, so during emulation this test never passes and no extra packet goes out.
+	// Callers must poll faster than the threshold; polling at it would let a tick land just under
+	// and defer the send by a whole extra period.
 	const UINT32 nNow = (UINT32)timeGetTime();
 	if ((UINT32)(nNow - nLastWireMs) < GROOVY_KEEPALIVE_IDLE_MS) return;
 
 	nLastWireMs = nNow;		// stamp first: a failed send must not retry every tick
 
-	// CMD_GET_STATUS is the handoff's recommended keepalive - one byte, no side effects, and any
-	// datagram resets the core's activity timer.
+	// CMD_GET_STATUS is one byte with no side effects, and any datagram resets the core's
+	// activity timer.
 	GroovySendRawCmd(szOpenHost, nOpenPort, GROOVY_CMD_GET_STATUS, "keepalive");
 
-	// Deliberately not logged per send: at one every 2s an idle session would fill the log. The
-	// once-per-transition line below is enough to show the mechanism is alive.
+	// Not logged per send: at one every 2s an idle session would fill the log. The
+	// once-per-transition line is enough to show the mechanism is alive.
 	GroovyLogOnChange(GROOVY_LOG_INFO, GROOVY_LOGKEY_KEEPALIVE,
 	                  "keepalive: holding the session open while idle (%d ms threshold)",
 	                  GROOVY_KEEPALIVE_IDLE_MS);
@@ -861,21 +808,15 @@ bool GroovyInternalIsConnected()
 
 bool GroovyWants32Bit()
 {
-	// Decided during VidInit(), long before a session exists, so this must not depend on
-	// one. RGB565 on the wire is happiest with FBNeo's existing 16bpp render (the pack is
-	// then a straight memcpy), so only RGB888 asks for the depth change.
+	// Decided during VidInit(), long before a session exists, so this must not depend on one.
+	// RGB565 on the wire suits FBNeo's existing 16bpp render, where the pack is a straight memcpy,
+	// so only RGB888 asks for the depth change.
 	//
-	// *** bDrvOkay is load-bearing, not defensive. ***
-	//
-	// Netplay calls MediaInit() BEFORE DrvInit() (fbn_ggpo.cpp:246-247), so it performs a
-	// full VidInit() with no driver loaded - a splash-sized video init that offline never
-	// does at all, because DrvInit deliberately suppresses it by faking bVidOkay
-	// (drv.cpp:187-191). Without this guard we changed the render depth during THAT init too,
-	// where the two guards below our line in dx9AltTextureInit are themselves `bDrvOkay &&`
-	// and therefore dead - silently overriding the user's Force 16-bit setting and driving a
-	// code path that has never executed in any configuration, vanilla or otherwise.
-	//
-	// We only care about the depth once a game is actually streaming, so tie it to that.
+	// bDrvOkay is load-bearing, not defensive. Netplay calls MediaInit() before DrvInit(), so it
+	// runs a full VidInit() with no driver loaded - something offline never does, because DrvInit
+	// suppresses it by faking bVidOkay. Without this guard the render depth changes during that
+	// init too, where the corresponding guards in dx9AltTextureInit are themselves bDrvOkay and
+	// therefore dead, silently overriding the user's Force 16-bit setting.
 	const bool bWants = (bGroovyEnabled != 0) && bDrvOkay && nGroovyRgbMode == RGB_888;
 
 	GroovyLogOnChange(GROOVY_LOG_ERROR, GROOVY_LOGKEY_VIDEOINIT,
@@ -903,16 +844,6 @@ bool GroovySuppressHostVSync()
 	return bSuppress;
 }
 
-// A session parameter that is baked into CMD_INIT changed under us.
-// The codec actually used, after the NLC+RGB565 substitution in SessionOpen(). Staleness
-// must be judged against this, or a substituted session would look stale every frame and
-// reconnect forever.
-static INT32 EffectiveCodec()
-{
-	if (nGroovyCodec == GROOVY_CODEC_NLC && nGroovyRgbMode == RGB_565) return GROOVY_CODEC_LZ4;
-	return nGroovyCodec;
-}
-
 // The CMD_INIT parameters that cannot change mid-session, so a change here means reconnect.
 //
 // KNOWN GAP: host and port are not checked, and nothing in the settings dialog's apply path closes
@@ -923,7 +854,7 @@ static INT32 EffectiveCodec()
 static bool SessionParamsStale()
 {
 	return bSessionOpen
-	    && (nOpenCodec != EffectiveCodec() || nOpenRgbMode != nGroovyRgbMode
+	    && (nOpenCodec != nGroovyCodec || nOpenRgbMode != nGroovyRgbMode
 	        || nOpenMtu != nGroovyMtu);
 }
 
@@ -971,8 +902,8 @@ void GroovyFrameReady()
 	//                      (drv.cpp:149), so this is the natural game-to-game boundary.
 	//   bGroovyEnabled 0 -> 1   the user re-enabled Groovy in the settings dialog.
 	//
-	// Anything else - a frame arriving moments after we deliberately closed - must NOT bring the
-	// session back. See bShutdownRequested.
+	// Anything else, such as a frame arriving moments after we deliberately closed, must not bring
+	// the session back. See bShutdownRequested.
 	static bool bPrevEnabled = false;
 	static bool bPrevDrvOkay = false;
 	const bool bNowEnabled = (bGroovyEnabled != 0);
@@ -1046,13 +977,11 @@ void GroovyFrameReady()
 	if (!bHaveModeline || !curModeline.SameSignal(dec.modeline)) {
 		const Modeline& m = dec.modeline;
 
-		// CmdSwitchres now ACKs and retries internally (up to 3x getACK(60), mirroring
-		// CmdInit) - see docs/CMDSWITCHRES_RECONNECT_HANDOFF.md. A non-zero return means the
-		// ACK never landed: the core's modeline state is unconfirmed, so leaving bHaveModeline
-		// set here would blit into a session that may be silently discarding every frame for
-		// the rest of its life (the exact bug the handoff fixed). Treat it like CheckSessionAlive()
-		// treats a dead session - close and let the normal back-off (SessionRetryDue()) retry -
-		// rather than "try again next frame".
+		// CmdSwitchres ACKs and retries internally, so a non-zero return means the ACK never
+		// landed and the core's modeline state is unconfirmed. Setting bHaveModeline anyway would
+		// blit into a session that may discard every frame for the rest of its life: the core
+		// leaves PoC_bytes_len at 0 until a switchres is processed, and only a reconnect can
+		// restore it. Close and let the normal back-off retry, as CheckSessionAlive() does.
 		if (gm.CmdSwitchres(m.pclock, m.hActive, m.hBegin, m.hEnd, m.hTotal,
 		                     m.vActive, m.vBegin, m.vEnd, m.vTotal, m.interlace) != 0) {
 			GroovyLogAlways("CmdSwitchres FAILED (no ACK after retry) for %dx%d %.3fMHz - "
@@ -1069,8 +998,9 @@ void GroovyFrameReady()
 		SetState("streaming %dx%d @ %.2fkHz", m.hActive, m.vActive, m.hfreq / 1000.0);
 	}
 
-	// Never write pixels anywhere but getPBufferBlit(): those buffers are allocated and,
-	// on Windows, registered with RIO at CmdInit. A memcpy in is fine; a pointer swap is not.
+	// Never write pixels anywhere but getPBufferBlit(). Those buffers are allocated and, on
+	// Windows, registered with RIO at CmdInit, so the send path knows their addresses. A memcpy
+	// into them is fine; a pointer swap is not.
 	char* pBlit = gm.getPBufferBlit(0);
 	if (!pBlit) return;
 
@@ -1089,16 +1019,13 @@ void GroovyFrameReady()
 	}
 	nLastBlitBytes = nBytes;
 
-	// The core displays frames in counter order and discards anything behind its current
-	// one, so resync if it has moved past us.
+	// The core displays frames in counter order and discards anything behind its current one, so
+	// resync if it has moved past us.
 	//
-	// BOUNDED. "The core moved past us" is a one- or two-frame condition; a lead of thousands
-	// was never a resync - it was the previous session's counter. That used to be reachable
-	// (CmdInit didn't clear it - the original reconnect-freeze bug: adopting frame 5473 at a
-	// core that had restarted at 1 spun WaitSync for 46 seconds), and is now fixed at the root
-	// in the vendored client (resetSessionState(), called at the top of every CmdInit - see the
-	// comment above ResetClientFrameState()). This bound stays as defense-in-depth: still cheap,
-	// still correct, and it means a lead can only ever mean the small, legitimate case.
+	// Bounded, because "the core moved past us" is a one- or two-frame condition. A lead of
+	// thousands is not a resync but a counter from a previous session, and adopting it hands
+	// WaitSync a spread it turns into minutes of busy-spin. The client zeroes its own fpga.* on
+	// every CmdInit now, so this bound should never be the thing that catches it.
 	if (gm.fpga.frame > nBlitFrame && gm.fpga.frame - nBlitFrame <= GROOVY_RASTER_MAX_SPREAD) {
 		nBlitFrame = gm.fpga.frame;
 	}
@@ -1181,28 +1108,20 @@ void GroovyWaitSync()
 	// the attribution has to describe the call we are about to make.
 	const bool bPacing = GroovyPacingActive();
 
-	// *** Nothing below this line may spin for seconds. ***
+	// Nothing below this line may spin for seconds.
 	//
-	// WaitSync's sleep is driven by DiffTimeRaster(), which computes
-	// dif = ((frameEcho-1)*vTotal + vCountEcho - frame*vTotal - vCount) / 2 and multiplies by
-	// m_widthTime. Since m_frameTime = m_widthTime * vTotal, the implied sleep is
-	// (m_frameTime * spread) / 2 - half a frame period per frame of divergence. A spread of 5472
-	// (the cable-pull reconnect) is 46 SECONDS of busy-spin, and WaitSync accumulates it across
-	// iterations, so it never returns. That is a force-kill, and it is what happened on hardware
-	// before the root cause was fixed (see ResetClientFrameState()'s comment).
+	// WaitSync's sleep comes from DiffTimeRaster(), which derives a raster distance from the two
+	// frame counters and multiplies by m_widthTime. Since m_frameTime = m_widthTime * vTotal, the
+	// implied sleep is half a frame period per frame of divergence, and WaitSync accumulates it
+	// across iterations - a spread in the thousands never returns. Only the positive direction
+	// spins, since a negative dif clamps sleepTime to 0, so one comparison is enough.
 	//
-	// Only the positive direction spins: a negative dif clamps sleepTime to 0 and falls straight
-	// through. So one comparison is enough.
-	//
-	// The vendored DiffTimeRaster() now carries an identical clamp internally (same threshold, 8 -
-	// our own suggestion, absorbed upstream), so this is no longer the only thing standing between
-	// a desync and a hang. It stays because it is also the diagnostic: the library's equivalent is
-	// a verbosity-2, per-frame LOG() call, and SessionOpen() caps client verbosity at 1 whenever
-	// file logging is on (level 2 would flood it) - so the library's own report of this condition
-	// is invisible in exactly the logs a user would send us. This one is GROOVY_LOG_ERROR/on-change,
-	// so it survives. Whatever desynchronises those two counters, we skip pacing for one frame
-	// rather than hang the emulator - one frame of imperfect pacing against a 46-second lock is not
-	// a difficult trade, even now that it should never trigger in practice.
+	// The client carries the same clamp internally now, so this is no longer the only thing
+	// between a desync and a hang. It stays for the diagnostic: the library reports this at
+	// verbosity 2 with a per-frame LOG(), and SessionOpen() caps client verbosity at 1 whenever
+	// file logging is on, so its report is invisible in exactly the logs a user would send. This
+	// one is on-change at error level and survives. Skipping pacing for one frame is a cheap
+	// trade against a lock-up.
 	const UINT32 nEcho = gm.fpga.frameEcho, nCoreFrame = gm.fpga.frame;
 	if (nEcho > nCoreFrame && nEcho - nCoreFrame > GROOVY_RASTER_MAX_SPREAD) {
 		GroovyLogOnChange(GROOVY_LOG_ERROR, GROOVY_LOGKEY_RASTERSPREAD,
@@ -1245,24 +1164,20 @@ void GroovyFrameSync()
 	// The app-master path: something else (GGPO plus FBNeo's timeGetTime accumulator) owns
 	// the frame clock, and we are only here to keep the client healthy.
 	//
-	// We still MUST call WaitSync every frame. drainSendCompletions() is private
-	// (groovymister.h:325) and WaitSync (groovymister.cpp:1301) is its only caller in the
-	// tree; the send completion queue is 846 entries and a 384x224 RGB888 frame posts ~175
-	// sends, so skipping it fills the queue in about five frames, after which RIOSend fails
-	// SILENTLY, ACKs stop arriving and the reconnect watchdog thrashes a perfectly good link.
+	// WaitSync must still be called every frame. drainSendCompletions() is private and WaitSync is
+	// its only caller; the send completion queue holds 846 entries and a 384x224 RGB888 frame
+	// posts around 175 sends, so skipping it fills the queue in about five frames, after which
+	// RIOSend fails silently, ACKs stop arriving, and the reconnect watchdog thrashes a good link.
 	//
-	// It is cheap here precisely because we arrive late. WaitSync computes
-	//     sleepTime = (m_emulationTime >= m_frameTime) ? 0 : m_frameTime - m_emulationTime
-	// where m_emulationTime is measured from the END of the previous WaitSync. Called once
-	// per frame after the host clock has already spent the frame period, sleepTime is 0, the
-	// spin loop runs a single iteration and falls straight through to the drain.
+	// It is cheap here because we arrive late. WaitSync sleeps for m_frameTime - m_emulationTime,
+	// and m_emulationTime is measured from the end of the previous WaitSync, so calling it once
+	// per frame after the host clock has already spent the frame period leaves nothing to sleep;
+	// the loop runs one iteration and falls through to the drain.
 	//
-	// Called unconditionally on the pass, including frames where no blit went out: a GGPO
-	// input stall returns early from RunFrame without producing a frame, and we still want
-	// fpga.frameEcho fresh for the status readout.
-	// bStreaming, not merely bSessionOpen: before the first CmdSwitchres the client has no
-	// modeline, so m_frameTime and m_vTotal are still 0 and the raster servo inside WaitSync
-	// has nothing meaningful to work from.
+	// Called even on frames where no blit went out, since a GGPO input stall returns early from
+	// RunFrame and we still want fpga.frameEcho fresh for the status readout. Gated on
+	// bStreaming rather than bSessionOpen because before the first CmdSwitchres the client has no
+	// modeline, leaving m_frameTime and m_vTotal at 0 with nothing for the raster servo to use.
 	if (!bSessionOpen || !bStreaming) return;
 	if (GroovyPacingActive()) return;	// we own the clock; RunIdle's Groovy branch syncs instead
 

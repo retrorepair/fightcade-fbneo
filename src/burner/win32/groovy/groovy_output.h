@@ -1,9 +1,8 @@
 // Groovy MiSTer - the sender: session lifecycle, per-frame blit, audio, and raster pacing.
 //
-// This header is what FBNeo sees. It exposes NO socket types and pulls in no system headers:
-// groovymister.h (and its <winsock2.h>) is confined to groovy_output.cpp, because
-// src/burner/win32/main.cpp includes the Winsock 1.1 <winsock.h> and MSVC will not tolerate
-// both in one translation unit. See src/dep/groovymister/PROVENANCE.md.
+// This header is what FBNeo sees. It exposes no socket types and pulls in no system headers:
+// groovymister.h, and its <winsock2.h>, is confined to groovy_output.cpp, because main.cpp
+// includes the Winsock 1.1 <winsock.h> and MSVC will not tolerate both in one translation unit.
 //
 // Include AFTER burner.h (needs INT32 / INT16 / TCHAR).
 
@@ -30,10 +29,10 @@ bool GroovyPacingActive();
 // Blocks until the right moment to start the next frame, using the ACK stream to close the
 // loop against the real CRT raster.
 //
-// On Windows this is ALSO the only thing that drains the RIO send-completion queue, so it
-// must be called every iteration while connected - including frames where nothing was
-// blitted. Skipping it fills the 846-entry queue within a few frames, after which sends fail
-// silently and it looks like a dead core.
+// On Windows this is also the only thing that drains the RIO send-completion queue, so it must be
+// called every iteration while connected, including frames where nothing was blitted. Skipping it
+// fills the 846-entry queue within a few frames, after which sends fail silently and it looks like
+// a dead core.
 void GroovyWaitSync();
 
 // The app-master counterpart of GroovyWaitSync(), for when something ELSE owns the frame
@@ -49,14 +48,14 @@ void GroovyFrameSync();
 // exactly what FBNeo already produces - and nSamples is nBurnSoundLen (sample frames, not
 // bytes). No-op unless audio is enabled and the core reports it accepted audio.
 //
-// Takes a NON-const pointer because in "MiSTer only" mode it also silences the host buffer
-// in place, so the policy lives here rather than leaking into run.cpp. Silencing rather
-// than skipping AudSoundFrame() keeps the DirectSound clock running, which AudSoundCheck()
-// depends on. The mute only happens when audio is genuinely reaching the MiSTer - a dead
-// or refused stream must never leave the user with no sound at all.
+// Takes a non-const pointer because in "MiSTer only" mode it also silences the host buffer in
+// place, keeping that policy here rather than in run.cpp. Silencing rather than skipping
+// AudSoundFrame() keeps the DirectSound clock running, which AudSoundCheck() depends on, and the
+// mute only happens when audio is genuinely reaching the MiSTer: a dead or refused stream must
+// never leave the user with no sound at all.
 //
-// Call it BEFORE AudSoundFrame(): DxSoundFrame() applies the optional low-pass DSP to this
-// same buffer in place, and the MiSTer should get the emulator's output, not a filtered copy.
+// Call it before AudSoundFrame(). DxSoundFrame() applies the optional low-pass DSP to this same
+// buffer in place, and the MiSTer should get the emulator's output, not a filtered copy.
 void GroovyAudioFrame(INT16* pPcm, INT32 nSamples);
 
 // ---------------------------------------------------------------------------
@@ -64,13 +63,16 @@ void GroovyAudioFrame(INT16* pPcm, INT32 nSamples);
 // ---------------------------------------------------------------------------
 
 // Hold an idle session open against the core's idle timeout (OSD: Server -> Idle timeout, 5s by
-// default). Sends a 1-byte CMD_GET_STATUS, but ONLY once nothing has gone on the wire for a couple
-// of seconds - so during emulation, where every blit counts as activity, it sends nothing at all.
+// default). We advertise GM_CAP_KEEPALIVE at CmdInit, which is what permits the core to close us
+// for going silent, so honouring it is an obligation rather than an optimisation.
 //
-// Call it OFTEN and cheaply: it is gated internally on elapsed time, and the caller's polling rate
+// Sends a 1-byte CMD_GET_STATUS, and only once nothing has gone on the wire for a couple of
+// seconds, so during emulation it sends nothing at all.
+//
+// Call it often and cheaply: it is gated internally on elapsed time, and the caller's polling rate
 // must be faster than that gate or the worst-case silence roughly doubles. The WM_TIMER in
-// scrn.cpp drives it at 250ms, which is what covers Win32 menus and modal dialogs - the cases
-// where FBNeo's frame loop stops entirely and the core would otherwise drop us.
+// scrn.cpp drives it at 250ms, which covers Win32 menus and modal dialogs - the cases where
+// FBNeo's frame loop stops entirely.
 //
 // No-op when no session is open, or after a deliberate close.
 void GroovyKeepAlive();
@@ -78,12 +80,12 @@ void GroovyKeepAlive();
 // Tear the session down. Idempotent, safe even if no session was ever opened, and safe to
 // call from any exit path including ones that run more than once.
 //
-// Sends CMD_CLOSE by plain sendto BEFORE tearing the RIO queues down, because the client's
-// own CmdClose() loses that race on Windows and leaves the core displaying the final frame
-// forever instead of returning to connection-search.
+// Sends CMD_CLOSE by plain sendto before tearing the RIO queues down, because the client's own
+// CmdClose() loses that race on Windows and leaves the core displaying the final frame instead of
+// returning to connection-search.
 //
 // pszReason is recorded in the log so a shutdown says which path it came from - window close,
-// match end, driver exit or process exit. Keep this FAST: on the MENU_QUIT path it runs
+// match end, driver exit or process exit. Keep this fast: on the MENU_QUIT path it runs
 // inside DrvExit(), ahead of the ggpo_close_session() that reports the match result.
 void GroovySessionClose(const char* pszReason = 0);
 
@@ -92,10 +94,9 @@ bool GroovyIsStreaming();
 
 // Does a Groovy session want the emulation rendered at 32bpp?
 //
-// Consulted by dx9AltTextureInit(), which currently hardcodes 16bpp. Deliberately does NOT
-// depend on the session being open - the depth is decided during VidInit(), long before the
-// first frame opens the session - so this answers "do we intend to stream RGB888", not
-// "are we streaming".
+// Consulted by dx9AltTextureInit(), which otherwise hardcodes 16bpp. Deliberately independent of
+// whether a session is open, because the depth is decided during VidInit(), long before the first
+// frame opens one. This answers "do we intend to stream RGB888", not "are we streaming".
 bool GroovyWants32Bit();
 
 // Should the host's own vsync be suppressed?
@@ -140,7 +141,7 @@ struct GroovyStatus {
 
 	// dSyncMs split by who owns the frame clock. Exactly one is non-zero per frame.
 	//
-	// When Groovy paces, WaitSync sleeping out the frame period IS the job and is most of a
+	// When Groovy paces, WaitSync sleeping out the frame period is the job and is most of a
 	// frame by construction - charging it made a healthy session read as 296/299 frames over
 	// budget. Under an external clock (netplay) sleepTime should be 0, so anything here is
 	// genuine overhead and is the figure worth watching.

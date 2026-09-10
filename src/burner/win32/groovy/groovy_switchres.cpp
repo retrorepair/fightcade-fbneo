@@ -199,7 +199,7 @@ bool GroovySwitchresPresetAsRequested()
 
 static GroovyModeDecision Unready()
 {
-	// Deliberately NOT cached: the reported geometry is briefly unstable right after a
+	// Deliberately not cached: the reported geometry is briefly unstable right after a
 	// driver init or a mode change, and latching that as a failure would wedge the stream
 	// until the game happened to change mode again.
 	GroovyModeDecision d;		// constructor already sets UNREADY / GATE_OK

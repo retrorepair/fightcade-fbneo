@@ -13,7 +13,7 @@
 //
 // The generator defines the sentinel, so requiring it converts that into a build failure.
 #if !defined(FBNEO_DETECTORS_GENERATED) && !defined(FBNEO_ALLOW_NO_DETECTORS)
- #error "Game detector data has not been generated - see docs/DETECTORS.md. Run detectors.pl, or define FBNEO_ALLOW_NO_DETECTORS to deliberately build without detectors (disables round counters and ranked match reporting)."
+ #error "Game detector data has not been generated. Run detectors.pl to generate it, or define FBNEO_ALLOW_NO_DETECTORS to build without detectors (which disables round counters and ranked match reporting)."
 #endif
 
 struct DetectorBuffer {
