@@ -13,11 +13,15 @@
  **************************************************************/
 
 #define MODULE_API_EXPORTS
+// <locale> ahead of switchres.h, which reaches windows.h. windows.h defines the SAL1
+// annotations __in and __out as empty macros, and libstdc++ uses both as parameter
+// names (ostream_insert.h, locale_facets.h), so the C++ headers must be parsed first.
+#include <locale>
+
 #include "switchres.h"
 #include "switchres_wrapper.h"
 #include "log.h"
 #include <stdio.h>
-#include <locale>
 #ifdef __cplusplus
 extern "C" {
 #endif

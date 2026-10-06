@@ -1,4 +1,6 @@
 #include "burner.h"
+// Kaillera_Modify_Play_Values below comes from here; burner.h does not pull it in.
+#include "net.h"
 
 const int MAXPLAYER = 4;
 static int nPlayerInputs[MAXPLAYER], nCommonInputs, nDIPInputs;

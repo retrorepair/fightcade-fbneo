@@ -1,8 +1,11 @@
+// read/write were file-scope statics shadowing the POSIX read()/write() that current
+// mingw-w64 headers declare, which is a redeclaration error rather than shadowing at
+// namespace scope. Renamed; they are static to this file and absent from the header.
 #include "burnint.h"
 #include "tlcs90_intf.h"
 
-static UINT8 (*read)(UINT32) = NULL;
-static void (*write)(UINT32, UINT8) = NULL;
+static UINT8 (*read_cb)(UINT32) = NULL;
+static void (*write_cb)(UINT32, UINT8) = NULL;
 static UINT8 (*readio)(UINT16) = NULL;
 static void (*writeio)(UINT16, UINT8) = NULL;
 
@@ -49,8 +52,8 @@ UINT8 tlcs90_program_read_byte(UINT32 address)
 		return mem[0][(address / 0x100)][address & 0xff];
 	}
 
-	if (read) {
-		return read(address);
+	if (read_cb) {
+		return read_cb(address);
 	}
 
 	return 0;
@@ -71,8 +74,8 @@ void tlcs90_program_write_byte(UINT32 address, UINT8 data)
 		return;
 	}
 
-	if (write) {
-		write(address, data);
+	if (write_cb) {
+		write_cb(address, data);
 		return;
 	}
 }
@@ -104,12 +107,12 @@ void tlcs90_io_write_byte(UINT16 port, UINT8 data)
 
 void tlcs90SetReadHandler(UINT8 (*pread)(UINT32))
 {
-	read = pread;
+	read_cb = pread;
 }
 
 void tlcs90SetWriteHandler(void (*pwrite)(UINT32, UINT8))
 {
-	write = pwrite;
+	write_cb = pwrite;
 }
 
 void tlcs90SetReadPortHandler(UINT8 (*pread)(UINT16))
@@ -169,8 +172,8 @@ INT32 tlcs90Init(INT32, INT32 clock)
 {
 	memset (mem, 0, 2 * 0x1000 * sizeof(UINT8 *));
 
-	read = NULL;
-	write = NULL;
+	read_cb = NULL;
+	write_cb = NULL;
 	readio = NULL;
 	writeio = NULL;
 
@@ -182,8 +185,8 @@ INT32 tlcs90Init(INT32, INT32 clock)
 INT32 tlcs90Exit()
 {
 	memset (mem, 0, 2 * 0x1000 * sizeof(UINT8 *));
-	read = NULL;
-	write = NULL;
+	read_cb = NULL;
+	write_cb = NULL;
 	readio = NULL;
 	writeio = NULL;
 

@@ -1,3 +1,10 @@
+// C++ headers first, before groovymister.h pulls in windows.h. A host tree can put a
+// cut-down sal.h on the include path (FBNeo ships one for XAudio2) whose __in/__out
+// expand to nothing; once those are defined, libstdc++ headers that use the same names
+// as parameters stop compiling. std::min and std::numeric_limits are used below.
+#include <algorithm>
+#include <limits>
+
 #include "groovymister.h"
 
 #include <stdint.h>

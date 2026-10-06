@@ -1,7 +1,24 @@
 #include <limits>
-#include <iostream>
-using std::cout;
-using std::endl;
+// The RIO prototypes below carry SAL annotations. Normally sal.h supplies them, but a
+// host tree can put its own cut-down sal.h on the include path ahead of the toolchain
+// one (FBNeo ships one for XAudio2), and then even windows.h's own #include <sal.h>
+// resolves to the stub and these are never defined. They are annotations with no effect
+// on codegen, so supply any that are missing rather than depend on which sal.h wins.
+#ifndef _In_
+#define _In_
+#endif
+#ifndef _In_opt_
+#define _In_opt_
+#endif
+#ifndef _In_reads_
+#define _In_reads_(s)
+#endif
+#ifndef _Out_writes_to_
+#define _Out_writes_to_(s, c)
+#endif
+// No <iostream> here: nothing in this header uses cout/endl, and rio.h is reached from
+// burner.h AFTER windows.h, whose SAL annotation macros (__in, __out) then expand inside
+// libstdc++ parameter lists and break the C++ headers outright.
 
 // Registered-IO surface for toolchains whose headers lack it (mingw-w64).
 // Keyed on RIO_INVALID_CQ: it ships in the SAME SDK block (mswsockdef.h,

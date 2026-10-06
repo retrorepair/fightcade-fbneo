@@ -380,6 +380,22 @@ ifdef BUILD_X86_ASM
 endif
 
 # For zlib
+# The tree is 8-bit Latin text, not UTF-8 (12 source files carry high-byte characters, none of
+# them valid UTF-8). GCC used to accept that silently; current versions assume UTF-8
+# input and stop with "converting to execution character set: Illegal byte sequence".
+# Groovy/switchres are vendored the same way the VS project builds them: switchres as a
+# pure modeline calculator (SR_CALC_ONLY drops the platform display backends, whose
+# display_windows.h is not even shipped here) and both libraries linked in rather than
+# loaded from a DLL. fbneo_vs2015.vcxproj sets these; the mingw build needs them too.
+DEF := $(DEF) -DSR_CALC_ONLY -DSR_WIN32_STATIC -DGROOVYMISTER_WIN32_STATIC
+
+DEF := $(DEF) -finput-charset=ISO-8859-1
+
+# windres is handed $(DEF) too and rejects compiler-only switches ("invalid option -f"),
+# so it gets the defines without them. Recursive assignment: expanded where it is used,
+# after every later DEF append.
+RCDEF = $(filter-out -finput-charset=%,$(DEF))
+
 DEF := $(DEF) -DNO_VIZ -D_LARGEFILE64_SOURCE=0 -D_FILE_OFFSET_BITS=32
 
 # For lib7z
@@ -681,23 +697,23 @@ endif
 %.o:	%.rc
 	@echo Compiling resource file $(<F)...
 ifdef GCC345
-	@windres $(DEF) $< -o $(subst $(srcdir),$(objdir),$(<D))/$(@F) $(foreach dir,$(alldir),--include-dir $(srcdir)$(dir))
+	@windres $(RCDEF) $< -o $(subst $(srcdir),$(objdir),$(<D))/$(@F) $(foreach dir,$(alldir),--include-dir $(srcdir)$(dir))
 endif
 ifdef GCC452
-	@windres $(DEF) $< -o $(subst $(srcdir),$(objdir),$(<D))/$(@F) $(foreach dir,$(alldir),--include-dir $(srcdir)$(dir))
+	@windres $(RCDEF) $< -o $(subst $(srcdir),$(objdir),$(<D))/$(@F) $(foreach dir,$(alldir),--include-dir $(srcdir)$(dir))
 endif
 ifdef GCC471
 ifdef BUILD_X64_EXE
-	@windres -F pe-x86-64 $(DEF) $< -o $(subst $(srcdir),$(objdir),$(<D))/$(@F) $(foreach dir,$(alldir),--include-dir $(srcdir)$(dir))
+	@windres -F pe-x86-64 $(RCDEF) $< -o $(subst $(srcdir),$(objdir),$(<D))/$(@F) $(foreach dir,$(alldir),--include-dir $(srcdir)$(dir))
 else
-	@windres -F pe-i386 $(DEF) $< -o $(subst $(srcdir),$(objdir),$(<D))/$(@F) $(foreach dir,$(alldir),--include-dir $(srcdir)$(dir))
+	@windres -F pe-i386 $(RCDEF) $< -o $(subst $(srcdir),$(objdir),$(<D))/$(@F) $(foreach dir,$(alldir),--include-dir $(srcdir)$(dir))
 endif
 endif
 ifdef GCC510
 ifdef BUILD_X64_EXE
-	@windres -F pe-x86-64 $(DEF) $< -o $(subst $(srcdir),$(objdir),$(<D))/$(@F) $(foreach dir,$(alldir),--include-dir $(srcdir)$(dir))
+	@windres -F pe-x86-64 $(RCDEF) $< -o $(subst $(srcdir),$(objdir),$(<D))/$(@F) $(foreach dir,$(alldir),--include-dir $(srcdir)$(dir))
 else
-	@windres -F pe-i386 $(DEF) $< -o $(subst $(srcdir),$(objdir),$(<D))/$(@F) $(foreach dir,$(alldir),--include-dir $(srcdir)$(dir))
+	@windres -F pe-i386 $(RCDEF) $< -o $(subst $(srcdir),$(objdir),$(<D))/$(@F) $(foreach dir,$(alldir),--include-dir $(srcdir)$(dir))
 endif
 endif
 
