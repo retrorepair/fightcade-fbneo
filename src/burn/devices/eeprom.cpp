@@ -19,6 +19,7 @@ static INT32 locked;
 static INT32 reset_delay;
 
 static INT32 neeprom_available = 0;
+static INT32 eeprom_persist = 0;	// this session loads and saves the .nv file (not a netgame/recording)
 
 static INT32 overrun_errmsg_ignore = 0;
 
@@ -93,21 +94,28 @@ void EEPROMInit(const eeprom_interface *interface)
 	if (intf->cmd_unlock) locked = 1;
 	else locked = 0;
 
-	/* @FC: Disable local save of EEPROM
-	TCHAR output[MAX_PATH];
-	_stprintf (output, _T("%s%s.nv"), szAppEEPROMPath, BurnDrvGetText(DRV_NAME));
-
+	// @FC disabled the EEPROM file outright, so every launch started from factory settings and a
+	// service-menu change (demo sounds, difficulty, ...) was lost on exit. That is wanted for a
+	// netgame, where both players and any replay must begin from the same machine state, and for
+	// recording or playing back from power-on. Plain local play has no such need, so the file is
+	// used again there. Decided once, here: by the time the game exits a netgame's flag may
+	// already be cleared, and that session must not write its default state over the local file.
+	eeprom_persist = !is_netgame_or_recording();
 	neeprom_available = 0;
 
-	INT32 len = ((1 << intf->address_bits) * (intf->data_bits >> 3)) & (MEMORY_SIZE-1);
+	if (eeprom_persist) {
+		TCHAR output[MAX_PATH];
+		_stprintf (output, _T("%s%s.nv"), szAppEEPROMPath, BurnDrvGetText(DRV_NAME));
 
-	FILE *fz = _tfopen(output, _T("rb"));
-	if (fz != NULL) {
-		neeprom_available = 1;
-		fread (eeprom_data, len, 1, fz);
-		fclose (fz);
+		INT32 len = ((1 << intf->address_bits) * (intf->data_bits >> 3)) & (MEMORY_SIZE-1);
+
+		FILE *fz = _tfopen(output, _T("rb"));
+		if (fz != NULL) {
+			neeprom_available = 1;
+			fread (eeprom_data, len, 1, fz);
+			fclose (fz);
+		}
 	}
-	*/
 }
 
 void EEPROMExit()
@@ -118,20 +126,22 @@ void EEPROMExit()
 
 	if (!DebugDev_EEPROMInitted) return;
 
-	/* @FC: Disable local save of EEPROM
-	TCHAR output[MAX_PATH];
-	_stprintf (output, _T("%s%s.nv"), szAppEEPROMPath, BurnDrvGetText(DRV_NAME));
+	// Only a session that loaded the file (see EEPROMInit) may write it back.
+	if (eeprom_persist) {
+		TCHAR output[MAX_PATH];
+		_stprintf (output, _T("%s%s.nv"), szAppEEPROMPath, BurnDrvGetText(DRV_NAME));
 
-	neeprom_available = 0;
+		neeprom_available = 0;
 
-	INT32 len = ((1 << intf->address_bits) * (intf->data_bits >> 3)) & (MEMORY_SIZE-1);
+		INT32 len = ((1 << intf->address_bits) * (intf->data_bits >> 3)) & (MEMORY_SIZE-1);
 
-	FILE *fz = _tfopen(output, _T("wb"));
-	if (fz) {
-		fwrite (eeprom_data, len, 1, fz);
-		fclose (fz);
+		FILE *fz = _tfopen(output, _T("wb"));
+		if (fz) {
+			fwrite (eeprom_data, len, 1, fz);
+			fclose (fz);
+		}
 	}
-	*/
+	eeprom_persist = 0;
 
 	overrun_errmsg_ignore = 0;
 
